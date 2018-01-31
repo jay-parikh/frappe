@@ -22,14 +22,7 @@ frappe.views.BaseList = class BaseList {
 			this.setup_page,
 			this.setup_page_head,
 			this.setup_side_bar,
-			this.setup_list_wrapper,
-			this.setup_filter_area,
-			this.setup_sort_selector,
-			this.setup_result_area,
-			this.setup_no_result_area,
-			this.setup_freeze_area,
-			this.setup_paging_area,
-			this.setup_footnote_area,
+			this.setup_main_section,
 			this.setup_view,
 		].map(fn => fn.bind(this));
 
@@ -53,6 +46,7 @@ frappe.views.BaseList = class BaseList {
 		this.can_delete = frappe.model.can_delete(this.doctype);
 		this.can_write = frappe.model.can_write(this.doctype);
 
+		this.fields = [];
 		this.filters = [];
 		this.order_by = 'modified desc';
 
@@ -76,80 +70,41 @@ frappe.views.BaseList = class BaseList {
 	}
 
 	set_fields() {
+		let fields = [].concat(
+			frappe.model.std_fields_list,
+			this.get_fields_in_list_view(),
+			[this.meta.title_field, this.meta.image_field],
+			(this.settings.add_fields || [])
+		);
 
-		this._fields = [];
-		const add_field = f => this._add_field(f);
-
-		// default fields
-		const std_fields = [
-			'name',
-			'owner',
-			'docstatus',
-			'_user_tags',
-			'_comments',
-			'modified',
-			'modified_by',
-			'_assign',
-			'_liked_by',
-			'_seen',
-			'enabled',
-			'disabled',
-			this.meta.title_field,
-			this.meta.image_field
-		];
-
-		std_fields.map(add_field);
-
-		// fields in_list_view
-		const fields = this.get_fields_in_list_view();
-		fields.map(add_field);
-
-		// currency fields
-		fields.filter(
-			df => df.fieldtype === 'Currency' && df.options
-		).map(df => {
-			if (df.options.includes(':')) {
-				add_field(df.options.split(':')[1]);
-			} else {
-				add_field(df.options);
-			}
-		});
-
-		// image fields
-		fields.filter(
-			df => df.fieldtype === 'Image'
-		).map(df => {
-			if (df.options) {
-				add_field(df.options);
-			} else {
-				add_field(df.fieldname);
-			}
-		});
-
-		// fields in listview_settings
-		(this.settings.add_fields || []).map(add_field);
+		fields.forEach(f => this._add_field(f));
 	}
 
 	get_fields_in_list_view() {
 		return this.meta.fields.filter(df => {
-			return df.in_list_view
+			return frappe.model.is_value_type(df.fieldtype) && (
+				df.in_list_view
 				&& frappe.perm.has_perm(this.doctype, df.permlevel, 'read')
-				&& frappe.model.is_value_type(df.fieldtype);
+			) || (
+				df.fieldtype === 'Currency'
+				&& df.options
+				&& !df.options.includes(':')
+			) || (
+				df.fieldname === 'status'
+			);
 		});
 	}
 
 	build_fields() {
 		// fill in missing doctype
-		this._fields = this._fields.map(f => {
+		this.fields = this.fields.map(f => {
 			if (typeof f === 'string') {
 				f = [f, this.doctype];
 			}
 			return f;
 		});
 		//de-dup
-		this._fields = this._fields.uniqBy(f => f[0] + f[1]);
-		// build this.fields
-		this.fields = this._fields.map(f => frappe.model.get_full_column_name(f[0], f[1]));
+		this.fields = this.fields.uniqBy(f => f[0] + f[1]);
 	}
 
 	_add_field(fieldname) {
@@ -170,7 +125,7 @@ frappe.views.BaseList = class BaseList {
 			return;
 		}
 
-		this._fields.push([fieldname, doctype]);
+		this.fields.push([fieldname, doctype]);
 	}
 
 	set_stats() {
@@ -231,6 +186,11 @@ frappe.views.BaseList = class BaseList {
 			page: this.page,
 			list_view: this
 		});
+	}
+
+	toggle_side_bar() {
+		this.list_sidebar.parent.toggleClass('hide');
+		this.page.current_view.find('.layout-main-section-wrapper').toggleClass('col-md-10 col-md-12');
 	}
 
 	setup_main_section() {
@@ -339,7 +299,8 @@ frappe.views.BaseList = class BaseList {
 	}
 
 	get_fields() {
-		return this.fields;
+		// convert [fieldname, Doctype] => tabDoctype.fieldname
+		return this.fields.map(f => frappe.model.get_full_column_name(f[0], f[1]));
 	}
 
 	setup_view() {
@@ -374,25 +335,24 @@ frappe.views.BaseList = class BaseList {
 		}).then(r => {
 			// render
 			this.freeze(false);
-
-			this.update_data(r);
-
+			this.prepare_data(r);
 			this.toggle_result_area();
 			this.before_render();
 			this.render();
 		});
 	}
 
-	update_data(r) {
+	prepare_data(r) {
 		let data = r.message || {};
 		data = frappe.utils.dict(data.keys, data.values);
-		data = data.uniqBy(d => d.name);
 
 		if (this.start === 0) {
 			this.data = data;
 		} else {
 			this.data = this.data.concat(data);
 		}
+
+		this.data = this.data.uniqBy(d => d.name);
 	}
 
 	freeze() {
@@ -475,15 +435,19 @@ class FilterArea {
 			filters = [filter];
 		}
 
+		filters = filters.filter(f => {
+			return !this.exists(f);
+		});
+
 		const { non_standard_filters, promise } = this.set_standard_filter(filters);
-		if (non_standard_filters.length === 0) {
-			return promise;
-		}
 
 		return promise
-			.then(() => this.filter_list.add_filters(non_standard_filters))
 			.then(() => {
-				if (refresh) return this.list_view.refresh();
+				return non_standard_filters.length > 0 &&
+					this.filter_list.add_filters(non_standard_filters);
+			})
+			.then(() => {
+				refresh && this.list_view.refresh();
 			});
 	}
 
@@ -493,7 +457,33 @@ class FilterArea {
 		}
 	}
 
+	exists(f) {
+		let exists = false;
+		// check in standard filters
+		const fields_dict = this.list_view.page.fields_dict;
+		if (f[2] === '=' && f[1] in fields_dict) {
+			const value = fields_dict[f[1]].get_value();
+			if (value) {
+				exists = true;
+			}
+		}
+
+		// check in filter area
+		if (!exists) {
+			exists = this.filter_list.filter_exists(f);
+		}
+
+		return exists;
+	}
+
 	set_standard_filter(filters) {
+		if (filters.length === 0) {
+			return {
+				non_standard_filters: [],
+				promise: Promise.resolve()
+			};
+		}
+
 		const fields_dict = this.list_view.page.fields_dict;
 
 		let out = filters.reduce((out, filter) => {
